@@ -23,7 +23,11 @@ const (
 	// not a substitute for object integrity verification.
 	rangeRetryTailSize = 4 * 1024
 	rangeReadSize      = 32 * 1024
-	rangeMaxEmptyReads = 100
+
+	// Use the same no-progress bound as bufio's maxConsecutiveEmptyReads:
+	// allow transient (0, nil) reads, but stop a reader that keeps returning them.
+	// See https://go.dev/src/bufio/bufio.go.
+	rangeMaxConsecutiveEmptyReads = 100
 )
 
 var rangeReaderCounter atomic.Uint64
@@ -102,7 +106,7 @@ func (r *RangeReader) Read(p []byte) (int, error) {
 		}
 		if read, err := r.readAhead(); read == 0 && err == nil {
 			emptyReads++
-			if emptyReads >= rangeMaxEmptyReads {
+			if emptyReads >= rangeMaxConsecutiveEmptyReads {
 				r.terminalError = io.ErrNoProgress
 				return n, r.terminalError
 			}
