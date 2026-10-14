@@ -17,6 +17,17 @@ import (
 const (
 	minRetryDelay = 30 * time.Millisecond
 	maxRetryDelay = 300 * time.Second
+
+	// Keep a suffix private so error text appended to a failed response can
+	// be discarded before the next ranged request. This is a bounded guard,
+	// not a substitute for object integrity verification.
+	rangeRetryTailSize = 4 * 1024
+	rangeReadSize      = 32 * 1024
+
+	// Use the same no-progress bound as bufio's maxConsecutiveEmptyReads:
+	// allow transient (0, nil) reads, but stop a reader that keeps returning them.
+	// See https://go.dev/src/bufio/bufio.go.
+	rangeMaxConsecutiveEmptyReads = 100
 )
 
 var rangeReaderCounter atomic.Uint64
@@ -28,13 +39,16 @@ type RangeReader struct {
 	input          s3.GetObjectInput
 	maxRetries     int
 	reconnects     int
-	storageCursor  int64
+	storageCursor  int64 // bytes committed to the caller buffer, excluding private read-ahead
 	expectedLength int64
 	pendingError   error
 	terminalError  error
 	closed         bool
 	logDebugID     uint64
 	wait           func(context.Context, time.Duration) error
+	buffer         [rangeRetryTailSize + rangeReadSize]byte
+	bufferOffset   int
+	buffered       int
 }
 
 func NewRangeReader(ctx context.Context, body io.ReadCloser, objectPath string, retriesCount int, folder *Folder) *RangeReader {
@@ -58,6 +72,8 @@ func newRangeReader(ctx context.Context, input *s3.GetObjectInput, object *s3.Ge
 	return r
 }
 
+// Read fills p with safe bytes unless the object ends or an error occurs.
+// A partial final read returns its byte count together with EOF or the error.
 func (r *RangeReader) Read(p []byte) (int, error) {
 	if r.closed {
 		return 0, io.ErrClosedPipe
@@ -68,39 +84,86 @@ func (r *RangeReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	n, emptyReads := 0, 0
 	for {
+		if err := r.ctx.Err(); err != nil {
+			return n, err
+		}
+		// Coalesce safe bytes across body reads and retries so retaining the
+		// tail does not expose fragmented fields to existing callers.
+		n += r.readBuffered(p[n:])
+		if n == len(p) {
+			return n, nil
+		}
 		if r.terminalError != nil {
-			return 0, r.terminalError
+			return n, r.terminalError
 		}
 		if r.pendingError != nil || r.lastBody == nil {
 			if err := r.reconnect(); err != nil {
 				r.terminalError = err
-				return 0, err
+				return n, err
 			}
 		}
-		n, err := r.lastBody.Read(p)
-		r.storageCursor += int64(n)
-		err = r.checkReadLength(err)
-		if err == nil {
-			return n, nil
-		}
-		if err == io.EOF || !r.folder.IsRetryableError(err) {
-			r.terminalError = err
-			return n, err
-		}
-		r.pendingError = err
-		if n > 0 {
-			return n, nil
+		if read, err := r.readAhead(); read == 0 && err == nil {
+			emptyReads++
+			if emptyReads >= rangeMaxConsecutiveEmptyReads {
+				r.terminalError = io.ErrNoProgress
+				return n, r.terminalError
+			}
+		} else {
+			emptyReads = 0
 		}
 	}
 }
 
+func (r *RangeReader) readBuffered(p []byte) int {
+	available := r.buffered - r.bufferOffset
+	if r.terminalError != io.EOF {
+		available -= rangeRetryTailSize
+	}
+	if available <= 0 {
+		return 0
+	}
+	n := copy(p, r.buffer[r.bufferOffset:r.bufferOffset+available])
+	r.bufferOffset += n
+	r.storageCursor += int64(n)
+	return n
+}
+
+func (r *RangeReader) readAhead() (int, error) {
+	// Drain all but the retained suffix before reading more. Compact only
+	// here, so small caller buffers do not repeatedly copy the whole buffer.
+	r.buffered = copy(r.buffer[:], r.buffer[r.bufferOffset:r.buffered])
+	r.bufferOffset = 0
+	n, err := r.lastBody.Read(r.buffer[r.buffered:])
+	r.buffered += n
+	err = r.checkReadLength(err)
+	if err == nil {
+		return n, nil
+	}
+	if err == io.EOF {
+		// Only a clean EOF releases the retained suffix.
+		r.terminalError = err
+		return n, err
+	}
+	// The retained suffix and bytes from the failed Read have not reached
+	// the caller. Discard them and resume from the delivered offset.
+	r.buffered = 0
+	if r.folder.IsRetryableError(err) {
+		r.pendingError = err
+	} else {
+		r.terminalError = err
+	}
+	return n, err
+}
+
 func (r *RangeReader) checkReadLength(err error) error {
+	readCursor := r.storageCursor + int64(r.buffered-r.bufferOffset)
 	if r.expectedLength >= 0 {
-		if r.storageCursor > r.expectedLength {
+		if readCursor > r.expectedLength {
 			return errors.New("S3 range response exceeds the original content length")
 		}
-		if err == io.EOF && r.storageCursor < r.expectedLength {
+		if err == io.EOF && readCursor < r.expectedLength {
 			return io.ErrUnexpectedEOF
 		}
 	}
