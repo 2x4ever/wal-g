@@ -23,6 +23,7 @@ const (
 	// not a substitute for object integrity verification.
 	rangeRetryTailSize = 4 * 1024
 	rangeReadSize      = 32 * 1024
+	rangeMaxEmptyReads = 100
 )
 
 var rangeReaderCounter atomic.Uint64
@@ -34,7 +35,7 @@ type RangeReader struct {
 	input          s3.GetObjectInput
 	maxRetries     int
 	reconnects     int
-	storageCursor  int64 // bytes delivered to the caller, excluding buffered read-ahead
+	storageCursor  int64 // bytes committed to the caller buffer, excluding private read-ahead
 	expectedLength int64
 	pendingError   error
 	terminalError  error
@@ -67,6 +68,8 @@ func newRangeReader(ctx context.Context, input *s3.GetObjectInput, object *s3.Ge
 	return r
 }
 
+// Read fills p with safe bytes unless the object ends or an error occurs.
+// A partial final read returns its byte count together with EOF or the error.
 func (r *RangeReader) Read(p []byte) (int, error) {
 	if r.closed {
 		return 0, io.ErrClosedPipe
@@ -77,21 +80,34 @@ func (r *RangeReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	n, emptyReads := 0, 0
 	for {
-		if n := r.readBuffered(p); n > 0 {
+		if err := r.ctx.Err(); err != nil {
+			return n, err
+		}
+		// Coalesce safe bytes across body reads and retries so retaining the
+		// tail does not expose fragmented fields to existing callers.
+		n += r.readBuffered(p[n:])
+		if n == len(p) {
 			return n, nil
 		}
 		if r.terminalError != nil {
-			return 0, r.terminalError
+			return n, r.terminalError
 		}
 		if r.pendingError != nil || r.lastBody == nil {
 			if err := r.reconnect(); err != nil {
 				r.terminalError = err
-				return 0, err
+				return n, err
 			}
 		}
-		if n, err := r.readAhead(); n == 0 && err == nil {
-			return 0, nil
+		if read, err := r.readAhead(); read == 0 && err == nil {
+			emptyReads++
+			if emptyReads >= rangeMaxEmptyReads {
+				r.terminalError = io.ErrNoProgress
+				return n, r.terminalError
+			}
+		} else {
+			emptyReads = 0
 		}
 	}
 }
