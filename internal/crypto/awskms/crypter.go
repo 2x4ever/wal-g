@@ -51,7 +51,7 @@ func (crypter *Crypter) Encrypt(ctx context.Context, writer io.Writer) (io.Write
 // Decrypt creates decrypted reader from ordinary reader
 func (crypter *Crypter) Decrypt(ctx context.Context, reader io.Reader) (io.Reader, error) {
 	encryptedSymmetricKey := make([]byte, crypter.SymmetricKey.GetEncryptedKeyLen())
-	_, err := reader.Read(encryptedSymmetricKey)
+	_, err := io.ReadFull(reader, encryptedSymmetricKey)
 	tracelog.ErrorLogger.FatalfOnError("Can't read encryption key from archive file header: %v", err)
 
 	err = crypter.SymmetricKey.SetEncryptedKey(encryptedSymmetricKey)
