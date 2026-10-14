@@ -45,8 +45,6 @@ func (b *rangeBody) Close() error                      { b.closed = true; return
 func noRangeWait(context.Context, time.Duration) error { return nil }
 
 func TestRangeRecoveryAfterHeaderTimeout(t *testing.T) {
-	prefix := strings.Repeat("a", 4099)
-	original := prefix + "def"
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if requests.Add(1) == 1 {
@@ -58,10 +56,10 @@ func TestRangeRecoveryAfterHeaderTimeout(t *testing.T) {
 		if got := req.Header.Get("Range"); got != "bytes=3-" {
 			t.Errorf("unexpected range %q", got)
 		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes 3-%d/%d", len(original)-1, len(original)))
-		w.Header().Set("Content-Length", fmt.Sprint(len(original)-3))
+		w.Header().Set("Content-Range", "bytes 3-5/6")
+		w.Header().Set("Content-Length", "3")
 		w.WriteHeader(http.StatusPartialContent)
-		_, _ = io.WriteString(w, original[3:])
+		_, _ = io.WriteString(w, "def")
 	}))
 	defer server.Close()
 	transport := &http.Transport{ResponseHeaderTimeout: time.Second}
@@ -75,27 +73,23 @@ func TestRangeRecoveryAfterHeaderTimeout(t *testing.T) {
 	folder := NewFolder(api, nil, "", &Config{Bucket: "bucket"})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	initial := io.NopCloser(io.MultiReader(strings.NewReader(prefix), &rangeBody{err: io.ErrUnexpectedEOF}))
+	initial := io.NopCloser(io.MultiReader(strings.NewReader("abc"), &rangeBody{err: io.ErrUnexpectedEOF}))
 	r := NewRangeReader(ctx, initial, "object", 2, folder)
 	r.wait = noRangeWait
 	defer r.Close()
 	data, err := io.ReadAll(r)
 	require.NoError(t, ctx.Err())
 	require.NoError(t, err)
-	require.Equal(t, original, string(data))
+	require.Equal(t, "abcdef", string(data))
 	require.EqualValues(t, 2, requests.Load())
 }
 
 func TestRangeRecoveryPreservesBytesAndIdentity(t *testing.T) {
 	for _, readErr := range []error{io.ErrUnexpectedEOF, io.EOF} {
 		t.Run(readErr.Error(), func(t *testing.T) {
-			prefix := strings.Repeat("a", 4099)
-			original := prefix + "def"
-			initial := &rangeTailBody{steps: []rangeTailRead{{data: prefix}, {err: readErr}}}
-			resumed := &rangeBody{data: original[3:], err: io.EOF}
-			gets := 0
+			initial := &rangeBody{data: "abc", err: readErr}
+			resumed := &rangeBody{data: "def", err: io.EOF}
 			api := &rangeAPI{get: func(in *awss3.GetObjectInput) (*awss3.GetObjectOutput, error) {
-				gets++
 				require.True(t, initial.closed)
 				require.Equal(t, "bytes=3-", aws.ToString(in.Range))
 				require.Equal(t, "version", aws.ToString(in.VersionId))
@@ -103,19 +97,19 @@ func TestRangeRecoveryPreservesBytesAndIdentity(t *testing.T) {
 				require.Equal(t, "AES256", aws.ToString(in.SSECustomerAlgorithm))
 				require.Equal(t, "test-key", aws.ToString(in.SSECustomerKey))
 				require.Equal(t, "test-md5", aws.ToString(in.SSECustomerKeyMD5))
-				return &awss3.GetObjectOutput{Body: resumed, ContentRange: aws.String(fmt.Sprintf("bytes 3-%d/%d", len(original)-1, len(original))),
-					ContentLength: aws.Int64(int64(len(original) - 3)), ETag: aws.String("etag"), VersionId: aws.String("version")}, nil
+				return &awss3.GetObjectOutput{Body: resumed, ContentRange: aws.String("bytes 3-5/6"),
+					ContentLength: aws.Int64(3), ETag: aws.String("etag"), VersionId: aws.String("version")}, nil
 			}}
 			folder := NewFolder(api, nil, "", &Config{})
 			input := &awss3.GetObjectInput{Bucket: aws.String("bucket"), Key: aws.String("object"),
 				SSECustomerAlgorithm: aws.String("AES256"), SSECustomerKey: aws.String("test-key"), SSECustomerKeyMD5: aws.String("test-md5")}
 			r := newRangeReader(t.Context(), input, &awss3.GetObjectOutput{Body: initial,
-				ContentLength: aws.Int64(int64(len(original))), ETag: aws.String("etag"), VersionId: aws.String("version")}, 1, folder)
+				ContentLength: aws.Int64(6), ETag: aws.String("etag"), VersionId: aws.String("version")}, 1, folder)
 			r.wait = noRangeWait
 			data, err := io.ReadAll(r)
 			require.NoError(t, err)
-			require.Equal(t, original, string(data))
-			require.Equal(t, 1, gets)
+			require.Equal(t, "abcdef", string(data))
+			require.Equal(t, 1, r.reconnects)
 			require.NoError(t, r.Close())
 			require.NoError(t, r.Close())
 			require.True(t, resumed.closed)
@@ -130,11 +124,11 @@ func TestRangeRecoveryBudgetIsCumulative(t *testing.T) {
 			bodies := []*rangeBody{{data: "a", err: io.ErrUnexpectedEOF}}
 			api := &rangeAPI{get: func(in *awss3.GetObjectInput) (*awss3.GetObjectOutput, error) {
 				gets++
-				require.Equal(t, "bytes=0-", aws.ToString(in.Range))
+				require.Equal(t, fmt.Sprintf("bytes=%d-", gets), aws.ToString(in.Range))
 				body := &rangeBody{data: "b", err: io.ErrUnexpectedEOF}
 				bodies = append(bodies, body)
-				return &awss3.GetObjectOutput{Body: body, ContentRange: aws.String("bytes 0-9/10"),
-					ContentLength: aws.Int64(10)}, nil
+				return &awss3.GetObjectOutput{Body: body, ContentRange: aws.String(fmt.Sprintf("bytes %d-9/10", gets)),
+					ContentLength: aws.Int64(int64(10 - gets))}, nil
 			}}
 			folder := NewFolder(api, nil, "", &Config{})
 			r := newRangeReader(t.Context(), folder.getObjectInput("object"),
@@ -142,7 +136,7 @@ func TestRangeRecoveryBudgetIsCumulative(t *testing.T) {
 			r.wait = noRangeWait
 			data, err := io.ReadAll(r)
 			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-			require.Empty(t, data)
+			require.Len(t, data, budget+1)
 			require.Equal(t, budget, gets)
 			require.NoError(t, r.Close())
 			for _, body := range bodies {
@@ -155,17 +149,16 @@ func TestRangeRecoveryBudgetIsCumulative(t *testing.T) {
 func TestRangeRecoveryRejectsInconsistentResponses(t *testing.T) {
 	for _, variant := range []string{"missing range", "wrong offset", "changed length", "changed etag", "changed version"} {
 		t.Run(variant, func(t *testing.T) {
-			prefix := strings.Repeat("a", 4097)
-			body := &rangeBody{data: prefix[1:] + "bc", err: io.EOF}
-			response := &awss3.GetObjectOutput{Body: body, ContentRange: aws.String("bytes 1-4098/4099"),
-				ContentLength: aws.Int64(4098), ETag: aws.String("original"), VersionId: aws.String("original")}
+			body := &rangeBody{data: "bc", err: io.EOF}
+			response := &awss3.GetObjectOutput{Body: body, ContentRange: aws.String("bytes 1-2/3"),
+				ContentLength: aws.Int64(2), ETag: aws.String("original"), VersionId: aws.String("original")}
 			switch variant {
 			case "missing range":
 				response.ContentRange = nil
 			case "wrong offset":
-				response.ContentRange = aws.String("bytes 0-4097/4099")
+				response.ContentRange = aws.String("bytes 0-1/3")
 			case "changed length":
-				response.ContentRange = aws.String("bytes 1-4098/4100")
+				response.ContentRange = aws.String("bytes 1-2/4")
 			case "changed etag":
 				response.ETag = aws.String("other")
 			case "changed version":
@@ -174,7 +167,7 @@ func TestRangeRecoveryRejectsInconsistentResponses(t *testing.T) {
 			api := &rangeAPI{get: func(*awss3.GetObjectInput) (*awss3.GetObjectOutput, error) { return response, nil }}
 			folder := NewFolder(api, nil, "", &Config{})
 			r := newRangeReader(t.Context(), folder.getObjectInput("object"), &awss3.GetObjectOutput{
-				Body: &rangeTailBody{steps: []rangeTailRead{{data: prefix}, {err: io.ErrUnexpectedEOF}}}, ContentLength: aws.Int64(4099),
+				Body: &rangeBody{data: "a", err: io.ErrUnexpectedEOF}, ContentLength: aws.Int64(3),
 				ETag: aws.String("original"), VersionId: aws.String("original")}, 2, folder)
 			r.wait = noRangeWait
 			data, err := io.ReadAll(r)

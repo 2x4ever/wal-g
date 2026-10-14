@@ -17,12 +17,6 @@ import (
 const (
 	minRetryDelay = 30 * time.Millisecond
 	maxRetryDelay = 300 * time.Second
-
-	// Keep a suffix private so error text appended to a failed response can
-	// be discarded before the next ranged request. This is a bounded guard,
-	// not a substitute for object integrity verification.
-	rangeRetryTailSize = 4 * 1024
-	rangeReadSize      = 32 * 1024
 )
 
 var rangeReaderCounter atomic.Uint64
@@ -34,16 +28,13 @@ type RangeReader struct {
 	input          s3.GetObjectInput
 	maxRetries     int
 	reconnects     int
-	storageCursor  int64 // bytes delivered to the caller, excluding buffered read-ahead
+	storageCursor  int64
 	expectedLength int64
 	pendingError   error
 	terminalError  error
 	closed         bool
 	logDebugID     uint64
 	wait           func(context.Context, time.Duration) error
-	buffer         [rangeRetryTailSize + rangeReadSize]byte
-	bufferOffset   int
-	buffered       int
 }
 
 func NewRangeReader(ctx context.Context, body io.ReadCloser, objectPath string, retriesCount int, folder *Folder) *RangeReader {
@@ -78,9 +69,6 @@ func (r *RangeReader) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 	for {
-		if n := r.readBuffered(p); n > 0 {
-			return n, nil
-		}
 		if r.terminalError != nil {
 			return 0, r.terminalError
 		}
@@ -90,60 +78,29 @@ func (r *RangeReader) Read(p []byte) (int, error) {
 				return 0, err
 			}
 		}
-		if n, err := r.readAhead(); n == 0 && err == nil {
-			return 0, nil
+		n, err := r.lastBody.Read(p)
+		r.storageCursor += int64(n)
+		err = r.checkReadLength(err)
+		if err == nil {
+			return n, nil
+		}
+		if err == io.EOF || !r.folder.IsRetryableError(err) {
+			r.terminalError = err
+			return n, err
+		}
+		r.pendingError = err
+		if n > 0 {
+			return n, nil
 		}
 	}
-}
-
-func (r *RangeReader) readBuffered(p []byte) int {
-	available := r.buffered - r.bufferOffset
-	if r.terminalError != io.EOF {
-		available -= rangeRetryTailSize
-	}
-	if available <= 0 {
-		return 0
-	}
-	n := copy(p, r.buffer[r.bufferOffset:r.bufferOffset+available])
-	r.bufferOffset += n
-	r.storageCursor += int64(n)
-	return n
-}
-
-func (r *RangeReader) readAhead() (int, error) {
-	// Drain all but the retained suffix before reading more. Compact only
-	// here, so small caller buffers do not repeatedly copy the whole buffer.
-	r.buffered = copy(r.buffer[:], r.buffer[r.bufferOffset:r.buffered])
-	r.bufferOffset = 0
-	n, err := r.lastBody.Read(r.buffer[r.buffered:])
-	r.buffered += n
-	err = r.checkReadLength(err)
-	if err == nil {
-		return n, nil
-	}
-	if err == io.EOF {
-		// Only a clean EOF releases the retained suffix.
-		r.terminalError = err
-		return n, err
-	}
-	// The retained suffix and bytes from the failed Read have not reached
-	// the caller. Discard them and resume from the delivered offset.
-	r.buffered = 0
-	if r.folder.IsRetryableError(err) {
-		r.pendingError = err
-	} else {
-		r.terminalError = err
-	}
-	return n, err
 }
 
 func (r *RangeReader) checkReadLength(err error) error {
-	readCursor := r.storageCursor + int64(r.buffered-r.bufferOffset)
 	if r.expectedLength >= 0 {
-		if readCursor > r.expectedLength {
+		if r.storageCursor > r.expectedLength {
 			return errors.New("S3 range response exceeds the original content length")
 		}
-		if err == io.EOF && readCursor < r.expectedLength {
+		if err == io.EOF && r.storageCursor < r.expectedLength {
 			return io.ErrUnexpectedEOF
 		}
 	}

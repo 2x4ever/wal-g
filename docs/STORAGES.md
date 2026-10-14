@@ -74,9 +74,7 @@ To configure AWS KMS key for client-side encryption and decryption. By default, 
 
 * `WALG_S3_RANGE_BATCH_ENABLED`
 
-Set to TRUE to resume interrupted S3 downloads using HTTP Range requests. Disabled by default. The reader retains the last 4096 bytes until more data or a clean EOF arrives. On a retryable read error, it discards this tail and any bytes returned with the error, then resumes from the first byte not yet delivered to the caller. Resumed requests retain SSE-C headers and the original object version or ETag when supplied by S3; inconsistent ranges or changed objects fail the read.
-
-This protects against error text injected into the final 4096 bytes of a failed response. It does not detect corruption outside that suffix or corruption in a response that finishes without a read error, and does not replace backup integrity verification.
+Set to TRUE to resume interrupted S3 downloads from the last byte read using HTTP Range requests. Disabled by default. Resumed requests retain SSE-C headers and the original object version or ETag when supplied by S3; inconsistent ranges or changed objects fail the read.
 
 * `WALG_S3_RANGE_MAX_RETRIES`
 
